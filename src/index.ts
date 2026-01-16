@@ -22,12 +22,27 @@ const PORT = Number(process.env.PORT ?? 3000);
 const TL_HOST = process.env.TL_HOST ?? "https://api-dev.tradelocker.com";
 const TL_NAMESPACE = "/brand-socket";
 const TL_PATH = process.env.TL_PATH ?? "/brand-api/socket.io";
-const TL_TYPE = process.env.TL_TYPE ?? "DEMO"; // docs use type=LIVE/DEMO in examples :contentReference[oaicite:1]{index=1}
+const TL_TYPE = process.env.TL_TYPE ?? "DEMO";
 const TL_BRAND_API_KEY = process.env.TL_BRAND_API_KEY;
 
 if (!TL_BRAND_API_KEY) throw new Error("Missing env TL_BRAND_API_KEY");
 
-const INTERNAL_TOKEN = process.env.INTERNAL_TOKEN; // optional auth for your SSE endpoint
+const INTERNAL_TOKEN = process.env.INTERNAL_TOKEN;
+
+// ---- simple structured logger ----
+function log(...args: any[]) {
+  console.log(new Date().toISOString(), ...args);
+}
+
+// Helpful to see env at boot (without leaking secrets)
+log("[boot] starting", {
+  TL_HOST,
+  TL_NAMESPACE,
+  TL_PATH,
+  TL_TYPE,
+  hasBrandKey: Boolean(TL_BRAND_API_KEY),
+  hasInternalToken: Boolean(INTERNAL_TOKEN),
+});
 
 function authed(req: express.Request): boolean {
   if (!INTERNAL_TOKEN) return true;
@@ -42,17 +57,15 @@ const socket: Socket = io(`${TL_HOST}${TL_NAMESPACE}`, {
   extraHeaders: { "brand-api-key": TL_BRAND_API_KEY },
 });
 
-socket.on("connect", () => console.log("[brandsocket] connected", socket.id));
-socket.on("disconnect", (r) => console.log("[brandsocket] disconnected", r));
-socket.on("error", (e) => console.log("[brandsocket] error", e));
+socket.on("connect", () => log("[brandsocket] connected", socket.id));
+socket.on("disconnect", (r) => log("[brandsocket] disconnected", r));
+socket.on("connect_error", (e) =>
+  log("[brandsocket] connect_error", { message: (e as any)?.message, e })
+);
+socket.on("error", (e) => log("[brandsocket] error", e));
+socket.on("connection", (msg) => log("[brandsocket] connection msg", msg));
 
-// BrandSocket can emit connection-status messages (including invalid API key) :contentReference[oaicite:2]{index=2}
-socket.on("connection", (msg) => console.log("[brandsocket] connection msg", msg));
-
-/**
- * subscription accounting: instrument -> count
- * First subscriber => SUBSCRIBE, last unsub => UNSUBSCRIBE :contentReference[oaicite:3]{index=3}
- */
+// subscription accounting: instrument -> count
 const instrumentCounts = new Map<string, number>();
 
 function norm(s: string) {
@@ -63,9 +76,12 @@ function subscribeInstrument(raw: string) {
   const instrument = norm(raw);
   const prev = instrumentCounts.get(instrument) ?? 0;
   instrumentCounts.set(instrument, prev + 1);
+
   if (prev === 0) {
-    socket.emit("subscriptions", { action: "SUBSCRIBE", instrument }); // :contentReference[oaicite:4]{index=4}
-    console.log("[brandsocket] SUBSCRIBE", instrument);
+    socket.emit("subscriptions", { action: "SUBSCRIBE", instrument });
+    log("[brandsocket] SUBSCRIBE", { instrument, count: prev + 1 });
+  } else {
+    log("[brandsocket] subscribe refcount++", { instrument, count: prev + 1 });
   }
 }
 
@@ -73,12 +89,14 @@ function unsubscribeInstrument(raw: string) {
   const instrument = norm(raw);
   const prev = instrumentCounts.get(instrument) ?? 0;
   const next = Math.max(0, prev - 1);
+
   if (prev > 0 && next === 0) {
-    socket.emit("subscriptions", { action: "UNSUBSCRIBE", instrument }); // :contentReference[oaicite:5]{index=5}
+    socket.emit("subscriptions", { action: "UNSUBSCRIBE", instrument });
     instrumentCounts.delete(instrument);
-    console.log("[brandsocket] UNSUBSCRIBE", instrument);
+    log("[brandsocket] UNSUBSCRIBE", { instrument });
   } else {
     instrumentCounts.set(instrument, next);
+    log("[brandsocket] subscribe refcount--", { instrument, count: next });
   }
 }
 
@@ -96,29 +114,78 @@ function sseWrite(res: express.Response, event: string, data: unknown) {
   res.write(`data: ${JSON.stringify(data)}\n\n`);
 }
 
-// Quotes arrive on "subscriptions" with payload like {type:"Quote", instrument, routeId, timestamp, bid, ask} :contentReference[oaicite:6]{index=6}
+// Diagnostics: log every inbound "subscriptions" message (rate-limited)
+let subMsgCount = 0;
+let subMsgLastLog = 0;
+
+function shouldLogSubMsg() {
+  const now = Date.now();
+  // log first 20 messages, then at most 1 per second
+  if (subMsgCount < 20) return true;
+  if (now - subMsgLastLog > 1000) return true;
+  return false;
+}
+
+// Quotes arrive on "subscriptions" with payload like {type:"Quote", instrument, routeId, timestamp, bid, ask}
 socket.on("subscriptions", (msg: unknown) => {
+  subMsgCount++;
+  if (shouldLogSubMsg()) {
+    subMsgLastLog = Date.now();
+    log("[brandsocket] subscriptions raw", msg);
+  }
+
   const q = msg as Partial<TLQuote>;
-  if (!q || q.type !== "Quote" || !q.instrument) return;
+  if (!q || !q.instrument) return;
+
+  // If payload differs, this will show up in the raw log above
+  if (q.type !== "Quote") return;
 
   const instrument = norm(q.instrument);
+  let forwarded = 0;
 
   for (const c of clients.values()) {
     if (c.instruments.has(instrument)) {
       sseWrite(c.res, "quote", q);
+      forwarded++;
     }
+  }
+
+  if (forwarded > 0 && shouldLogSubMsg()) {
+    log("[relay] forwarded quote", { instrument, forwarded, routeId: q.routeId, bid: q.bid, ask: q.ask });
   }
 });
 
-app.get("/health", (_req, res) => res.json({ ok: true }));
+// Optional: log stream messages (can be very noisy; rate-limited)
+let streamCount = 0;
+let streamLastLog = 0;
+socket.on("stream", (data: unknown) => {
+  streamCount++;
+  const now = Date.now();
+  if (streamCount <= 5 || now - streamLastLog > 2000) {
+    streamLastLog = now;
+    log("[brandsocket] stream sample", data);
+  }
+});
 
-/**
- * SSE endpoint:
- * GET /sse?instruments=EURUSD,GBPUSD
- * Optional auth: Authorization: Bearer <INTERNAL_TOKEN>
- */
+app.get("/health", (_req, res) =>
+  res.json({
+    ok: true,
+    socketConnected: socket.connected,
+    clients: clients.size,
+    subscribedInstruments: Array.from(instrumentCounts.keys()),
+  })
+);
+
 app.get("/sse", (req, res) => {
-  if (!authed(req)) return res.status(401).json({ error: "unauthorized" });
+  const ok = authed(req);
+  log("[http] /sse", {
+    ok,
+    ip: req.headers["x-forwarded-for"] ?? req.socket.remoteAddress,
+    ua: req.headers["user-agent"],
+    q: req.originalUrl,
+  });
+
+  if (!ok) return res.status(401).json({ error: "unauthorized" });
 
   const instrumentsParam = String(req.query.instruments ?? "");
   const instruments = instrumentsParam
@@ -140,27 +207,23 @@ app.get("/sse", (req, res) => {
   const id = crypto.randomUUID();
   const set = new Set(instruments);
 
-  // Track
-  const client: SSEClient = { id, res, instruments: set };
-  clients.set(id, client);
+  clients.set(id, { id, res, instruments: set });
+  log("[sse] client connected", { id, instruments: Array.from(set), clients: clients.size });
 
-  // Subscribe to instruments on BrandSocket
   for (const inst of set) subscribeInstrument(inst);
 
-  // Keepalive ping (prevents some proxies from killing the stream)
   const keepalive = setInterval(() => {
     sseWrite(res, "ping", { t: new Date().toISOString() });
   }, 15000);
 
-  // Cleanup on disconnect
   req.on("close", () => {
     clearInterval(keepalive);
     clients.delete(id);
     for (const inst of set) unsubscribeInstrument(inst);
+    log("[sse] client closed", { id, clients: clients.size });
   });
 
-  // Initial ack
   sseWrite(res, "ready", { id, instruments });
 });
 
-app.listen(PORT, () => console.log(`listening on :${PORT}`));
+app.listen(PORT, () => log(`listening on :${PORT}`));
