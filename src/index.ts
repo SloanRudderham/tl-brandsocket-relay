@@ -22,19 +22,17 @@ const PORT = Number(process.env.PORT ?? 3000);
 const TL_HOST = process.env.TL_HOST ?? "https://api-dev.tradelocker.com";
 const TL_NAMESPACE = "/brand-socket";
 const TL_PATH = process.env.TL_PATH ?? "/brand-api/socket.io";
-const TL_TYPE = process.env.TL_TYPE ?? "DEMO";
+const TL_TYPE = process.env.TL_TYPE ?? "DEMO"; // DEMO or LIVE
 const TL_BRAND_API_KEY = process.env.TL_BRAND_API_KEY;
 
 if (!TL_BRAND_API_KEY) throw new Error("Missing env TL_BRAND_API_KEY");
 
-const INTERNAL_TOKEN = process.env.INTERNAL_TOKEN;
+const INTERNAL_TOKEN = process.env.INTERNAL_TOKEN; // optional auth for your SSE endpoint
 
-// ---- simple structured logger ----
 function log(...args: any[]) {
   console.log(new Date().toISOString(), ...args);
 }
 
-// Helpful to see env at boot (without leaking secrets)
 log("[boot] starting", {
   TL_HOST,
   TL_NAMESPACE,
@@ -50,21 +48,6 @@ function authed(req: express.Request): boolean {
   return got === INTERNAL_TOKEN;
 }
 
-const socket: Socket = io(`${TL_HOST}${TL_NAMESPACE}`, {
-  path: TL_PATH,
-  transports: ["websocket"],
-  query: { type: TL_TYPE },
-  extraHeaders: { "brand-api-key": TL_BRAND_API_KEY },
-});
-
-socket.on("connect", () => log("[brandsocket] connected", socket.id));
-socket.on("disconnect", (r) => log("[brandsocket] disconnected", r));
-socket.on("connect_error", (e) =>
-  log("[brandsocket] connect_error", { message: (e as any)?.message, e })
-);
-socket.on("error", (e) => log("[brandsocket] error", e));
-socket.on("connection", (msg) => log("[brandsocket] connection msg", msg));
-
 // subscription accounting: instrument -> count
 const instrumentCounts = new Map<string, number>();
 
@@ -78,8 +61,12 @@ function subscribeInstrument(raw: string) {
   instrumentCounts.set(instrument, prev + 1);
 
   if (prev === 0) {
-    socket.emit("subscriptions", { action: "SUBSCRIBE", instrument });
-    log("[brandsocket] SUBSCRIBE", { instrument, count: prev + 1 });
+    if (socket.connected) {
+      socket.emit("subscriptions", { action: "SUBSCRIBE", instrument });
+      log("[brandsocket] SUBSCRIBE", { instrument, count: prev + 1 });
+    } else {
+      log("[brandsocket] SUBSCRIBE queued (socket disconnected)", { instrument, count: prev + 1 });
+    }
   } else {
     log("[brandsocket] subscribe refcount++", { instrument, count: prev + 1 });
   }
@@ -91,14 +78,56 @@ function unsubscribeInstrument(raw: string) {
   const next = Math.max(0, prev - 1);
 
   if (prev > 0 && next === 0) {
-    socket.emit("subscriptions", { action: "UNSUBSCRIBE", instrument });
+    if (socket.connected) {
+      socket.emit("subscriptions", { action: "UNSUBSCRIBE", instrument });
+      log("[brandsocket] UNSUBSCRIBE", { instrument });
+    } else {
+      log("[brandsocket] UNSUBSCRIBE queued (socket disconnected)", { instrument });
+    }
     instrumentCounts.delete(instrument);
-    log("[brandsocket] UNSUBSCRIBE", { instrument });
   } else {
     instrumentCounts.set(instrument, next);
     log("[brandsocket] subscribe refcount--", { instrument, count: next });
   }
 }
+
+function resubscribeAll() {
+  const instruments = Array.from(instrumentCounts.keys());
+  if (instruments.length) log("[brandsocket] resubscribeAll", instruments);
+  for (const instrument of instruments) {
+    socket.emit("subscriptions", { action: "SUBSCRIBE", instrument });
+  }
+}
+
+const socket: Socket = io(`${TL_HOST}${TL_NAMESPACE}`, {
+  path: TL_PATH,
+  transports: ["websocket"],
+  query: { type: TL_TYPE },
+  extraHeaders: { "brand-api-key": TL_BRAND_API_KEY },
+
+  reconnection: true,
+  reconnectionAttempts: Infinity,
+  reconnectionDelay: 1000,
+  reconnectionDelayMax: 5000,
+  timeout: 20000,
+});
+
+socket.on("connect", () => {
+  log("[brandsocket] connected", socket.id);
+  resubscribeAll();
+});
+
+socket.on("disconnect", (reason) => log("[brandsocket] disconnected", reason));
+socket.on("connect_error", (e) =>
+  log("[brandsocket] connect_error", { message: (e as any)?.message, e })
+);
+socket.on("error", (e) => log("[brandsocket] error", e));
+socket.on("connection", (msg) => log("[brandsocket] connection msg", msg));
+
+// extra reconnection telemetry
+socket.io.on("reconnect_attempt", (n) => log("[brandsocket] reconnect_attempt", n));
+socket.io.on("reconnect_error", (e) => log("[brandsocket] reconnect_error", (e as any)?.message ?? e));
+socket.io.on("reconnect", (n) => log("[brandsocket] reconnected", n));
 
 // SSE client registry
 type SSEClient = {
@@ -114,19 +143,18 @@ function sseWrite(res: express.Response, event: string, data: unknown) {
   res.write(`data: ${JSON.stringify(data)}\n\n`);
 }
 
-// Diagnostics: log every inbound "subscriptions" message (rate-limited)
+// Diagnostics: log inbound "subscriptions" messages (rate-limited)
 let subMsgCount = 0;
 let subMsgLastLog = 0;
 
 function shouldLogSubMsg() {
   const now = Date.now();
-  // log first 20 messages, then at most 1 per second
   if (subMsgCount < 20) return true;
   if (now - subMsgLastLog > 1000) return true;
   return false;
 }
 
-// Quotes arrive on "subscriptions" with payload like {type:"Quote", instrument, routeId, timestamp, bid, ask}
+// Quotes arrive on "subscriptions"
 socket.on("subscriptions", (msg: unknown) => {
   subMsgCount++;
   if (shouldLogSubMsg()) {
@@ -137,7 +165,7 @@ socket.on("subscriptions", (msg: unknown) => {
   const q = msg as Partial<TLQuote>;
   if (!q || !q.instrument) return;
 
-  // If payload differs, this will show up in the raw log above
+  // Only forward quotes
   if (q.type !== "Quote") return;
 
   const instrument = norm(q.instrument);
@@ -151,11 +179,17 @@ socket.on("subscriptions", (msg: unknown) => {
   }
 
   if (forwarded > 0 && shouldLogSubMsg()) {
-    log("[relay] forwarded quote", { instrument, forwarded, routeId: q.routeId, bid: q.bid, ask: q.ask });
+    log("[relay] forwarded quote", {
+      instrument,
+      forwarded,
+      routeId: q.routeId,
+      bid: q.bid,
+      ask: q.ask,
+    });
   }
 });
 
-// Optional: log stream messages (can be very noisy; rate-limited)
+// Optional: log stream samples (can be noisy)
 let streamCount = 0;
 let streamLastLog = 0;
 socket.on("stream", (data: unknown) => {
